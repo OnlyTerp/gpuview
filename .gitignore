@@ -1,0 +1,7 @@
+# build output (exe compiles to T:\gpuview\ on the Windows side, never in-repo)
+*.exe
+*.pdb
+
+# capture artifacts
+*.png
+watch_*/
