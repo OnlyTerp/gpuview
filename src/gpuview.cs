@@ -15,6 +15,7 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Windows.Forms;
 
 static class Native
 {
@@ -269,6 +270,140 @@ static class Program
             c.Save(path, ImageFormat.Png);
     }
 
+    static int Area(RECT r)
+    {
+        return Math.Max(0, r.r - r.l) * Math.Max(0, r.b - r.t);
+    }
+
+    static long SumArea(List<RECT> rects)
+    {
+        long total = 0;
+        foreach (var r in rects) total += Area(r);
+        return total;
+    }
+
+    static double NonBlackFraction(Bitmap bmp)
+    {
+        int W = bmp.Width, H = bmp.Height;
+        int sx = Math.Max(1, W / 320), sy = Math.Max(1, H / 180);
+        long sampled = 0, nonblack = 0;
+        var bd = bmp.LockBits(new Rectangle(0, 0, W, H), ImageLockMode.ReadOnly, PixelFormat.Format32bppRgb);
+        try
+        {
+            unsafe
+            {
+                for (int y = 0; y < H; y += sy)
+                {
+                    byte* p = (byte*)bd.Scan0 + y * bd.Stride;
+                    for (int x = 0; x < W; x += sx)
+                    {
+                        byte* px = p + x * 4;
+                        sampled++;
+                        if (px[0] > 2 || px[1] > 2 || px[2] > 2) nonblack++;
+                    }
+                }
+            }
+        }
+        finally { bmp.UnlockBits(bd); }
+        return sampled == 0 ? 0 : (double)nonblack / sampled;
+    }
+
+    static Bitmap CaptureGdi(uint outIdx, out Rectangle bounds)
+    {
+        var screens = Screen.AllScreens;
+        int idx = outIdx < screens.Length ? (int)outIdx : 0;
+        bounds = screens[idx].Bounds;
+        var bmp = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppRgb);
+        using (var g = Graphics.FromImage(bmp))
+            g.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, bounds.Size, CopyPixelOperation.SourceCopy);
+        return bmp;
+    }
+
+    static List<RECT> Refine(Bitmap prev, Bitmap cur, List<RECT> hints, int minArea, int pad)
+    {
+        int W = cur.Width, H = cur.Height, tile = 32;
+        if (prev == null || prev.Width != W || prev.Height != H) return Merge(hints, pad, W, H);
+
+        var hs = hints.Count == 0
+            ? new List<RECT> { new RECT { l = 0, t = 0, r = W, b = H } }
+            : Merge(hints, 0, W, H);
+        int gw = (W + tile - 1) / tile, gh = (H + tile - 1) / tile;
+        var dirtyTiles = new bool[gw * gh];
+        var bounds = new Rectangle(0, 0, W, H);
+        var pbd = prev.LockBits(bounds, ImageLockMode.ReadOnly, PixelFormat.Format32bppRgb);
+        var cbd = cur.LockBits(bounds, ImageLockMode.ReadOnly, PixelFormat.Format32bppRgb);
+        try
+        {
+            unsafe
+            {
+                foreach (var raw in hs)
+                {
+                    var h = new RECT { l = Math.Max(0, raw.l), t = Math.Max(0, raw.t), r = Math.Min(W, raw.r), b = Math.Min(H, raw.b) };
+                    if (h.r <= h.l || h.b <= h.t) continue;
+                    int tx0 = h.l / tile, ty0 = h.t / tile;
+                    int tx1 = (h.r - 1) / tile, ty1 = (h.b - 1) / tile;
+                    for (int ty = ty0; ty <= ty1; ty++)
+                    for (int tx = tx0; tx <= tx1; tx++)
+                    {
+                        int x0 = Math.Max(h.l, tx * tile), y0 = Math.Max(h.t, ty * tile);
+                        int x1 = Math.Min(h.r, (tx + 1) * tile), y1 = Math.Min(h.b, (ty + 1) * tile);
+                        int changed = 0; bool found = false;
+                        for (int y = y0; y < y1 && !found; y++)
+                        {
+                            byte* p = (byte*)pbd.Scan0 + y * pbd.Stride + x0 * 4;
+                            byte* c = (byte*)cbd.Scan0 + y * cbd.Stride + x0 * 4;
+                            for (int x = x0; x < x1; x++, p += 4, c += 4)
+                            {
+                                int d = Math.Abs(p[0] - c[0]) + Math.Abs(p[1] - c[1]) + Math.Abs(p[2] - c[2]);
+                                if (d > 45 && ++changed >= 8) { found = true; break; }
+                            }
+                        }
+                        if (found) dirtyTiles[ty * gw + tx] = true;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            prev.UnlockBits(pbd);
+            cur.UnlockBits(cbd);
+        }
+
+        var seen = new bool[dirtyTiles.Length];
+        var boxes = new List<RECT>();
+        int[] qx = new int[dirtyTiles.Length], qy = new int[dirtyTiles.Length];
+        int[] dx = { 1, -1, 0, 0 }, dy = { 0, 0, 1, -1 };
+        for (int y = 0; y < gh; y++)
+        for (int x = 0; x < gw; x++)
+        {
+            int start = y * gw + x;
+            if (!dirtyTiles[start] || seen[start]) continue;
+            int head = 0, tail = 0, minX = x, maxX = x, minY = y, maxY = y;
+            qx[tail] = x; qy[tail++] = y; seen[start] = true;
+            while (head < tail)
+            {
+                int cx = qx[head], cy = qy[head++];
+                if (cx < minX) minX = cx; if (cx > maxX) maxX = cx;
+                if (cy < minY) minY = cy; if (cy > maxY) maxY = cy;
+                for (int i = 0; i < 4; i++)
+                {
+                    int nx = cx + dx[i], ny = cy + dy[i];
+                    if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+                    int ni = ny * gw + nx;
+                    if (!dirtyTiles[ni] || seen[ni]) continue;
+                    seen[ni] = true; qx[tail] = nx; qy[tail++] = ny;
+                }
+            }
+            var box = new RECT { l = minX * tile, t = minY * tile, r = Math.Min(W, (maxX + 1) * tile), b = Math.Min(H, (maxY + 1) * tile) };
+            if (Area(box) >= minArea) boxes.Add(box);
+        }
+
+        var refined = Merge(boxes, pad, W, H);
+        var keep = new List<RECT>();
+        foreach (var r in refined) if (Area(r) >= minArea) keep.Add(r);
+        return keep;
+    }
+
     static int Main(string[] args)
     {
         Native.SetProcessDpiAwarenessContext((IntPtr)(-4)); // PerMonitorV2
@@ -284,13 +419,30 @@ static class Program
                 if (mode == "frame")
                 {
                     string outPath = args.Length > 1 ? args[1] : Path.Combine(Path.GetTempPath(), "gpuview_frame.png");
-                    // First Acquire often returns the desktop as one big dirty rect; retry on timeout
-                    Bitmap bmp = null; List<RECT> dirty; bool to;
-                    for (int i = 0; i < 10 && bmp == null; i++)
-                        bmp = dup.Acquire(500, out dirty, out to);
-                    if (bmp == null) { Console.WriteLine("{\"event\":\"error\",\"msg\":\"no frame (static screen and no initial frame)\"}"); return 2; }
+                    Bitmap bmp = null; List<RECT> dirty; bool to; double nb = 0; string source = "dxgi";
+                    for (int i = 0; i < 20; i++)
+                    {
+                        var candidate = dup.Acquire(250, out dirty, out to);
+                        if (candidate == null) continue;
+                        nb = NonBlackFraction(candidate);
+                        if (nb > 0.001)
+                        {
+                            bmp = candidate;
+                            break;
+                        }
+                        candidate.Dispose();
+                    }
+                    if (bmp == null)
+                    {
+                        Rectangle b;
+                        bmp = CaptureGdi(outIdx, out b);
+                        nb = NonBlackFraction(bmp);
+                        source = "gdi_fallback";
+                    }
+                    if (bmp == null) { Console.WriteLine("{\"event\":\"error\",\"msg\":\"no frame\"}"); return 2; }
                     bmp.Save(outPath, ImageFormat.Png);
-                    Console.WriteLine("{\"event\":\"frame\",\"path\":\"" + J(outPath) + "\",\"w\":" + dup.W + ",\"h\":" + dup.H + ",\"fmt\":" + dup.Fmt + "}");
+                    Console.WriteLine("{\"event\":\"frame\",\"path\":\"" + J(outPath) + "\",\"w\":" + bmp.Width + ",\"h\":" + bmp.Height + ",\"fmt\":" + dup.Fmt + ",\"source\":\"" + source + "\",\"nonblack\":" + nb.ToString("F6") + "}");
+                    bmp.Dispose();
                 }
                 else if (mode == "watch")
                 {
@@ -301,29 +453,30 @@ static class Program
                     var t0 = DateTime.UtcNow; int n = 0;
                     // prime: get baseline frame
                     List<RECT> dirty; bool to;
-                    Bitmap baseline = null;
-                    for (int i = 0; i < 10 && baseline == null; i++) baseline = dup.Acquire(500, out dirty, out to);
-                    if (baseline != null)
+                    Bitmap prev = null;
+                    for (int i = 0; i < 10 && prev == null; i++) prev = dup.Acquire(500, out dirty, out to);
+                    if (prev != null)
                     {
                         string bp = Path.Combine(dir, "baseline.png");
-                        baseline.Save(bp, ImageFormat.Png);
+                        prev.Save(bp, ImageFormat.Png);
                         Console.WriteLine("{\"event\":\"baseline\",\"path\":\"" + J(bp) + "\",\"w\":" + dup.W + ",\"h\":" + dup.H + "}");
-                        baseline.Dispose();
                     }
                     while ((DateTime.UtcNow - t0).TotalSeconds < secs)
                     {
                         var bmp = dup.Acquire(1000, out dirty, out to);
                         if (bmp == null) continue;        // timeout = nothing changed
-                        var regions = Merge(dirty, 8, dup.W, dup.H);
-                        var keep = new List<RECT>();
-                        foreach (var r in regions)
-                            if ((r.r - r.l) * (r.b - r.t) >= minArea) keep.Add(r);
+                        var raw = Merge(dirty, 8, dup.W, dup.H);
+                        var keep = Refine(prev, bmp, raw, minArea, 8);
                         if (keep.Count > 0)
                         {
                             n++;
                             var sb = new StringBuilder();
                             sb.Append("{\"event\":\"change\",\"n\":").Append(n).Append(",\"t\":")
-                              .Append(((DateTime.UtcNow - t0).TotalMilliseconds).ToString("F0")).Append(",\"regions\":[");
+                              .Append(((DateTime.UtcNow - t0).TotalMilliseconds).ToString("F0"))
+                              .Append(",\"raw_regions\":").Append(raw.Count)
+                              .Append(",\"raw_area\":").Append(SumArea(raw))
+                              .Append(",\"refined_area\":").Append(SumArea(keep))
+                              .Append(",\"regions\":[");
                             for (int i = 0; i < keep.Count; i++)
                             {
                                 var r = keep[i];
@@ -337,8 +490,10 @@ static class Program
                             sb.Append("]}");
                             Console.WriteLine(sb.ToString());
                         }
-                        bmp.Dispose();
+                        if (prev != null) prev.Dispose();
+                        prev = bmp;
                     }
+                    if (prev != null) prev.Dispose();
                     Console.WriteLine("{\"event\":\"done\",\"changes\":" + n + "}");
                 }
                 else

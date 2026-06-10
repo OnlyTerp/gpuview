@@ -14,6 +14,33 @@ CSC='/mnt/c/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe'
 
 win2wsl() { sed -E 's|^([A-Za-z]):\\|/mnt/\L\1\E/|; s|\\|/|g'; }
 
+json_paths_to_wsl() {
+  python3 -c '
+import json, re, sys
+
+def win_to_wsl(path):
+    m = re.match(r"^([A-Za-z]):\\(.*)$", path)
+    if not m:
+        return path
+    return "/mnt/" + m.group(1).lower() + "/" + m.group(2).replace("\\", "/")
+
+for line in sys.stdin:
+    line = line.rstrip("\r\n")
+    if not line:
+        continue
+    try:
+        event = json.loads(line)
+        if "path" in event:
+            event["path_wsl"] = win_to_wsl(event["path"])
+        for region in event.get("regions", []):
+            if "crop" in region:
+                region["crop_wsl"] = win_to_wsl(region["crop"])
+        print(json.dumps(event, separators=(",", ":")), flush=True)
+    except Exception:
+        print(line, flush=True)
+'
+}
+
 rebuild() {
   mkdir -p /mnt/t/gpuview
   cp "$SRC" /mnt/t/gpuview/gpuview.cs
@@ -34,7 +61,7 @@ case "${1:-frame}" in
   watch)
     SECS="${2:-10}"; MON="${3:-0}"; MINPX="${4:-400}"
     DIR="T:\\gpuview\\watch_$(date +%s)"
-    "$EXE_WSL" watch "$SECS" "$DIR" "$MINPX" "mon=$MON"
+    "$EXE_WSL" watch "$SECS" "$DIR" "$MINPX" "mon=$MON" | json_paths_to_wsl
     ;;
   rebuild) rebuild ;;
   *) echo "usage: gpuview.sh frame [mon] | watch <secs> [mon] [minpx] | rebuild" >&2; exit 1 ;;

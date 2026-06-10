@@ -1,6 +1,6 @@
 ---
 name: gpuview
-description: GPU-native real-time screen capture via DXGI Desktop Duplication. Gets frames straight from the GPU compositor (zero-copy handoff, the same surface scanned out to the monitor) instead of slow GDI copies, and uses the GPU's own dirty-rect metadata to report ONLY the regions of the screen that changed — a compressed change-feed an AI can consume instead of full screenshots. Use to watch the screen in real time, detect what changed where, capture HDR desktops, or grab frames of GPU-composited apps. Complements the screenshot skill (which provides input control).
+description: GPU-native real-time screen capture via DXGI Desktop Duplication. Gets frames from the GPU compositor, uses DXGI dirty-rect metadata as change hints, refines coalesced rectangles into readable crop PNGs, and emits WSL-usable JSON paths. Use to watch the screen in real time, detect what changed where, capture HDR desktops, or grab frames of GPU-composited apps. Complements the screenshot skill (which provides input control).
 ---
 
 # gpuview — GPU-native screen capture + change-feed
@@ -13,12 +13,14 @@ of dirty regions + small crops — typically >90% less image data for UI monitor
 
 ## How it works
 
-A 15KB C# exe (`T:\gpuview\gpuview.exe`, source in `src/gpuview.cs`) talks raw COM
-vtables to D3D11/DXGI: `DuplicateOutput` → `AcquireNextFrame` (zero-copy GPU surface)
+A C# exe (`T:\gpuview\gpuview.exe`, source in `src/gpuview.cs`) talks raw COM
+vtables to D3D11/DXGI: `DuplicateOutput` → `AcquireNextFrame` (GPU surface)
 → `CopyResource` to a staging texture → `Map` to CPU → PNG. Dirty rects come from
-`GetFrameDirtyRects` — the compositor's own change metadata, not pixel diffing.
+`GetFrameDirtyRects`; `watch` then refines those hints with previous-frame pixel
+diffs so coalesced compositor rectangles become readable changed-content crops.
 Handles HDR desktops (RGBA16F scRGB → tonemapped sRGB). Per-monitor (`mon=N` = DXGI
-output index).
+output index). `frame` reports `source` and `nonblack`, and retries/falls back rather
+than silently returning an all-black PNG.
 
 ## Usage
 
@@ -32,13 +34,14 @@ $GV rebuild                    # recompile exe from src (csc, ~1s)
 
 `watch` output (one JSON line per event):
 ```json
-{"event":"baseline","path":"...baseline.png","w":3840,"h":2160}
-{"event":"change","n":3,"t":1820,"regions":[{"x":2398,"y":1452,"w":1182,"h":164,"crop":"T:\\gpuview\\watch_...\\chg_3_0.png"}]}
+{"event":"baseline","path":"T:\\gpuview\\watch_...\\baseline.png","w":3840,"h":2160,"path_wsl":"/mnt/t/gpuview/watch_.../baseline.png"}
+{"event":"change","n":3,"t":1820,"raw_regions":2,"raw_area":640100,"refined_area":196352,"regions":[{"x":216,"y":344,"w":944,"h":208,"crop":"T:\\gpuview\\watch_...\\chg_3_0.png","crop_wsl":"/mnt/t/gpuview/watch_.../chg_3_0.png"}]}
 {"event":"done","changes":42}
 ```
-- `t` = ms since start; `minpx` filters regions smaller than that pixel area
-  (default 400 — kills cursor blinks). Crops are Windows paths; convert with
-  `sed -E 's|^([A-Za-z]):\\|/mnt/\L\1\E/|; s|\\|/|g'`.
+- `t` = ms since start; `raw_area` is compositor dirty-rect area; `refined_area`
+  is the final crop area after previous-frame refinement. `minpx` filters regions
+  smaller than that pixel area (default 400 — kills cursor blinks). Read
+  `crop_wsl` directly from WSL.
 
 ## When to use which eye
 

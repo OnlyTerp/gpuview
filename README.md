@@ -5,7 +5,7 @@ handoff (DXGI Desktop Duplication) and let the GPU itself tell the agent *which
 pixels changed* — a compressed change-feed instead of full-screen screenshots.
 
 ```
-{"event":"change","n":3,"t":1820,"regions":[{"x":2398,"y":1452,"w":1182,"h":164,"crop":"...\\chg_3_0.png"}]}
+{"event":"change","n":3,"t":1820,"raw_area":640100,"refined_area":196352,"regions":[{"x":216,"y":344,"w":944,"h":208,"crop":"T:\\gpuview\\...\\chg_3_0.png","crop_wsl":"/mnt/t/gpuview/.../chg_3_0.png"}]}
 ```
 
 In a live test on a 4K desktop, `watch` collapsed **1.13 billion pixels** of
@@ -20,11 +20,13 @@ compositor already knows exactly what changed each frame — Windows exposes tha
 via `IDXGIOutputDuplication::GetFrameDirtyRects`. gpuview surfaces that metadata
 as a JSON event stream plus tiny crop PNGs of only the changed regions.
 
-- **Zero-copy capture path** — `AcquireNextFrame` hands over the exact surface
-  scanned out to your monitor. No GDI `CopyFromScreen`, no black frames from
-  GPU-composited apps (games, Electron, video).
-- **Dirty rects are free** — no pixel-diffing on the CPU; the change metadata
-  comes from the OS compositor itself.
+- **GPU-first capture path** — `AcquireNextFrame` hands over the exact surface
+  scanned out to your monitor. `frame` retries black first-frames and reports
+  `source` + `nonblack`; if DXGI only returns black for a static desktop, it
+  falls back to `CopyFromScreen` instead of silently handing the agent junk.
+- **Dirty rects + refinement** — the OS compositor supplies dirty rect hints;
+  `watch` then refines them against the previous frame so coalesced compositor
+  rectangles become smaller, readable changed-content crops.
 - **HDR aware** — detects RGBA16F scRGB desktops and tonemaps to sRGB.
 - **Tiny** — one 15KB C# exe, compiled with the `csc.exe` that ships in every
   Windows install. No SDK, no NuGet, no native build toolchain.
